@@ -1,0 +1,5 @@
+state_size: 64
+depth: 1
+preprocess: 5.309
+run: 335404
+Memory: 2504 KB, Time: 5:35.41 Sec

@@ -1,0 +1,1 @@
+(<(url|URL)>(http|https)://(.+\.)*.+/(.+/)*</(url|URL)>|<www.*key="(.+/)*.+">|<ee>(http|https)://(.+\.)*.+/(.+/)*</ee>)

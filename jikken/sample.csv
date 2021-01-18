@@ -1,0 +1,3 @@
+execute file,pattern file,memory usage,preprocess time,running time
+non-SIMD,pattern1.txt,"メモリの使用量","プリプロセスの時間","実行時間"
+SIMD,pattern1.txt,"メモリの使用量",プリプロセスの時間,"実行時間"

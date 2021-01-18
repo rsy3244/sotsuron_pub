@@ -1,0 +1,874 @@
+#include "Bitmask.h"
+
+Bitmask::Bitmask(std::size_t size_): size(size_), BLK(size_), SRC(size_), DST(size_) {}
+#include "Bitvector.h"
+#include "parameter.h"
+
+#include <x86intrin.h>
+
+#include <iostream>
+#include <cstddef>
+#include <cassert>
+#include <bitset>
+
+Bitvector::Bitvector(const std::size_t size): m_capacity((size+WORDSIZE-1)/WORDSIZE), m_val((size+WORDSIZE-1)/WORDSIZE), m_size(size) {}
+
+Bitvector::Bitvector(const Bitvector& obj): m_val(obj.m_val), m_capacity(obj.m_capacity), m_size(obj.m_size) {}
+
+void Bitvector::set(std::size_t idx, bool flag) {
+	m_val[idx/WORDSIZE] |= (static_cast<Data>(1) << (idx % WORDSIZE));
+}
+
+bool Bitvector::get(std::size_t idx) const {
+	return m_val[idx/WORDSIZE] & (static_cast<Data>(1) << (idx % WORDSIZE));
+}
+
+std::size_t Bitvector::size() const {
+	return m_capacity;
+}
+
+void Bitvector::dump()const {
+	for(std::size_t i = m_capacity; i-- > 0; ) {
+		for(std::size_t j = 0; j < WORDSIZE; j+=4){
+			std::cerr << std::bitset<4>(m_val[i]>> (WORDSIZE-j-4)) << " ";
+		}
+	}
+	std::cerr << std::endl;
+}
+
+Bitvector& Bitvector::operator+=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	Data carry = 0;
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		m_val[i] += rhs.m_val[i] + carry;
+		carry = m_val[i] < rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator-=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	Data borrow = 0;
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		Data tmp = m_val[i] < rhs.m_val[i];
+		m_val[i] -= rhs.m_val[i] + borrow;
+		borrow = tmp;
+	}
+	return *this;
+}
+
+#ifdef ALLOW_SIMD_INSTRUCTION
+
+Bitvector& Bitvector::operator|=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	std::size_t align_size = (m_capacity / 4) * 4;
+	for(std::size_t i = 0; i < align_size; i += 4) {
+		auto l = _mm256_loadu_si256((__m256i *)(m_val.data() +i));
+		auto r = _mm256_loadu_si256((__m256i *)(rhs.m_val.data() +i));
+		auto ret = _mm256_or_si256(l, r);
+		_mm256_storeu_si256((__m256i *)(m_val.data() +i), ret);
+	}
+	for(std::size_t i = align_size; i < m_capacity; ++i) {
+		m_val[i] |= rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator|=(const Data rhs) {
+	m_val[0] |= rhs;
+	return *this;
+}
+
+Bitvector& Bitvector::operator&=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	std::size_t align_size = (m_capacity / 4) * 4;
+	for(std::size_t i = 0; i < align_size; i += 4) {
+		auto l = _mm256_loadu_si256((__m256i *)(m_val.data() +i));
+		auto r = _mm256_loadu_si256((__m256i *)(rhs.m_val.data() +i));
+		auto ret = _mm256_and_si256(l, r);
+		_mm256_storeu_si256((__m256i *)(m_val.data() +i), ret);
+	}
+	for(std::size_t i = align_size; i < m_capacity; ++i) {
+		m_val[i] &= rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator^=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	std::size_t align_size = (m_capacity / 4) * 4;
+	for(std::size_t i = 0; i < align_size; i += 4) {
+		auto l = _mm256_loadu_si256((__m256i *)(m_val.data() +i));
+		auto r = _mm256_loadu_si256((__m256i *)(rhs.m_val.data() +i));
+		auto ret = _mm256_xor_si256(l, r);
+		_mm256_storeu_si256((__m256i *)(m_val.data() +i), ret);
+	}
+	for(std::size_t i = align_size; i < m_capacity; ++i) {
+		m_val[i] ^= rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector Bitvector::operator~() const {
+	Bitvector ret(*this);
+	std::size_t align_size = (m_capacity / 4) * 4;
+	for(std::size_t i = 0; i < align_size; i += 4) {
+		auto l = _mm256_loadu_si256((__m256i *)(m_val.data() +i));
+		auto r = _mm256_cmpeq_epi8(l, l);
+		r = _mm256_xor_si256(l, r);
+		_mm256_storeu_si256((__m256i *)(ret.m_val.data() +i), r);
+	}
+	for(std::size_t i = align_size; i < m_capacity; ++i) {
+		ret.m_val[i] = ~m_val[i];
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator=(Bitvector&& rhs) & noexcept{
+	m_val = std::move(rhs.m_val);
+	m_size = rhs.m_size;
+	m_capacity = rhs.m_capacity;
+	return *this;
+}
+
+Bitvector& Bitvector::operator<<=(const std::size_t rhs) {
+	Data carry = 0;
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		m_val[i] = (m_val[i] << rhs)| carry;
+		carry = m_val[i] >> (WORDSIZE - rhs);
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator>>=(const std::size_t rhs) {
+	Data borrow = 0;
+	std::size_t rest = rhs;
+	if(rhs >= m_size){
+		for(auto &e : m_val) e = 0;
+	}
+	if(rest >= WORDSIZE) {
+		std::size_t shift = rhs / WORDSIZE;
+		Data tmp = m_val[m_capacity-1];
+		for(std::size_t i = m_capacity-1; i-shift+1 > 0; --i) {
+			m_val[i-shift] = tmp;
+		}
+		for(std::size_t i = 0; i < shift; ++i) {
+			m_val[m_capacity-1-i] = 0;
+		}
+		rest %= WORDSIZE;
+		if(rest == 0)return *this;
+	}
+	for(std::size_t i = m_capacity-1; i+1 > 0; --i) {
+		m_val[i] = (m_val[i] >> rest) | borrow;
+		borrow = m_val[i] << (WORDSIZE - rest);
+	}
+	return *this;
+}
+
+
+Bitvector operator+(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) += rhs; }
+Bitvector operator-(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) -= rhs; }
+Bitvector operator|(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) |= rhs; }
+Bitvector operator|(const Bitvector& lhs, const Data rhs) { return Bitvector(lhs) |= rhs; }
+Bitvector operator&(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) &= rhs; }
+Bitvector operator^(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) ^= rhs; }
+Bitvector operator<<(const Bitvector& lhs, const std::size_t rhs) { return Bitvector(lhs) <<= rhs; }
+Bitvector operator>>(const Bitvector& lhs, const std::size_t rhs) { return Bitvector(lhs) >>= rhs; }
+
+#else
+
+Bitvector& Bitvector::operator|=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		m_val[i] |= rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator|=(const Data rhs) {
+	m_val[0] |= rhs;
+	return *this;
+}
+
+Bitvector& Bitvector::operator&=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		m_val[i] &= rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator^=(const Bitvector& rhs) {
+	assert(this->size() == rhs.size());
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		m_val[i] ^= rhs.m_val[i];
+	}
+	return *this;
+}
+
+Bitvector Bitvector::operator~() const {
+	Bitvector ret(*this);
+	for(auto &e : ret.m_val) {
+		e = ~e;
+	}
+	return ret;
+}
+
+Bitvector& Bitvector::operator=(Bitvector&& rhs) & noexcept{
+	m_val = std::move(rhs.m_val);
+	m_size = rhs.m_size;
+	m_capacity = rhs.m_capacity;
+	return *this;
+}
+
+Bitvector& Bitvector::operator<<=(const std::size_t rhs) {
+	Data carry = 0;
+	for(std::size_t i = 0; i < m_capacity; ++i) {
+		m_val[i] = (m_val[i] << rhs)| carry;
+		carry = m_val[i] >> (WORDSIZE - rhs);
+	}
+	return *this;
+}
+
+Bitvector& Bitvector::operator>>=(const std::size_t rhs) {
+	Data borrow = 0;
+	std::size_t rest = rhs;
+	if(rhs >= m_size){
+		for(auto &e : m_val) e = 0;
+	}
+	if(rest >= WORDSIZE) {
+		std::size_t shift = rhs / WORDSIZE;
+		Data tmp = m_val[m_capacity-1];
+		for(std::size_t i = m_capacity-1; i-shift+1 > 0; --i) {
+			m_val[i-shift] = tmp;
+		}
+		for(std::size_t i = 0; i < shift; ++i) {
+			m_val[m_capacity-1-i] = 0;
+		}
+		rest %= WORDSIZE;
+		if(rest == 0)return *this;
+	}
+	for(std::size_t i = m_capacity-1; i+1 > 0; --i) {
+		m_val[i] = (m_val[i] >> rest) | borrow;
+		borrow = m_val[i] << (WORDSIZE - rest);
+	}
+	return *this;
+}
+
+Bitvector operator+(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) += rhs; }
+Bitvector operator-(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) -= rhs; }
+Bitvector operator|(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) |= rhs; }
+Bitvector operator|(const Bitvector& lhs, const Data rhs) { return Bitvector(lhs) |= rhs; }
+Bitvector operator&(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) &= rhs; }
+Bitvector operator^(const Bitvector& lhs, const Bitvector& rhs) { return Bitvector(lhs) ^= rhs; }
+Bitvector operator<<(const Bitvector& lhs, const std::size_t rhs) { return Bitvector(lhs) <<= rhs; }
+Bitvector operator>>(const Bitvector& lhs, const std::size_t rhs) { return Bitvector(lhs) >>= rhs; }
+
+#endif
+
+
+#include "Matcher.h"
+
+#include <cstddef>
+#include <cassert>
+#include <queue>
+#include <iostream>
+#include <vector>
+
+void Matcher::scatter(const std::size_t depth) {
+	state |= ((m_scatter[depth].BLK - (state & m_scatter[depth].SRC)) & m_scatter[depth].DST);
+}
+
+void Matcher::gather(const std::size_t depth) {
+	state |= ((m_gather[depth].BLK + (state & m_gather[depth].SRC)) & m_gather[depth].DST);
+}
+
+void Matcher::propagate(const std::size_t depth) {
+	Bitvector a(m_propagate[depth].DST);
+	a |= (state & m_propagate[depth].BLK);
+	state |= (m_propagate[depth].BLK & ((~(a - m_propagate[depth].SRC)) ^ a));
+}
+
+void Matcher::back_eps(const std::size_t depth) {
+	if(m_back_src.size() == 0) return;
+	Bitvector a(state);
+	a &= m_back_src[depth];
+	for(std::size_t i = 0; i < m_back_blk[depth].size(); ++i) {
+		// a = ((a & ~m_back_blk[depth][i]) | (a & m_back_blk[depth][i]) >> (1 << i));
+		Bitvector tmp(a);
+		tmp &= m_back_blk[depth][i];
+		tmp >>= (1 << i);
+		a &= ~m_back_blk[depth][i];
+		a |= tmp;
+	}
+	a &= m_back_dst[depth];
+	state |= a;
+}
+
+void Matcher::move(const char c) {
+	std::size_t idx = static_cast<std::size_t>(c);
+	state = (((state << static_cast<std::size_t>(1)) & CHR[idx]) | 1) | (state & REP[idx]);
+}
+
+void Matcher::eps_closure() {
+	for(std::size_t k = m_depth-1; k+1 > 1; --k ) {
+		propagate(k);
+		back_eps(k);
+		gather(k-1);
+	}
+	propagate(0);
+	back_eps(0);
+	for(std::size_t k = 1; k < m_depth; ++k) {
+		scatter(k-1);
+		propagate(k);
+	}
+}
+
+Matcher::Matcher(TNFA& tnfa):
+	m_depth(0), m_state_size(tnfa.size()), m_accept(tnfa.size()-1) { 
+	for(auto &e : CHR) e = Bitvector(m_state_size);
+	for(auto &e : REP) e = Bitvector(m_state_size);
+	for(auto a : tnfa.m_edges) for(auto e : a) {
+		if(e.label) {
+			if(e.src == e.dst) REP[static_cast<std::size_t>(e.label.value())].set(e.dst, true);
+			else CHR[static_cast<std::size_t>(e.label.value())].set(e.dst, true);
+		}
+	}
+	std::vector<std::size_t> depth(m_state_size, 0);
+	std::size_t now_depth = 0;
+	for(std::size_t idx = 0; idx < m_state_size; ++idx) {
+		std::size_t edge_size = 0;
+		for(auto e : tnfa.m_edges[idx]) if(!e.label && e.src < e.dst) edge_size += 1;
+		std::size_t rev_edge_size = 0;
+		for(auto e : tnfa.m_rev_edges[idx]) if(!e.label && e.src < e.dst) rev_edge_size += 1;
+		if(rev_edge_size > 1) now_depth -= 1;
+		depth[idx] = now_depth;
+		if(edge_size > 1) {
+			now_depth += 1;
+			m_depth = std::max(now_depth, m_depth);
+		}
+	}
+	m_depth += 1;
+
+	m_gather = std::vector<Bitmask>(m_depth, Bitmask(m_state_size));
+	m_scatter = std::vector<Bitmask>(m_depth, Bitmask(m_state_size));
+	m_propagate = std::vector<Bitmask>(m_depth, Bitmask(m_state_size));
+
+	for(std::size_t d = m_depth-1; d+1 > 0; --d) {
+		for(std::size_t idx = 0; idx < m_state_size; ++idx) {
+			if(depth[idx] > d) m_gather[d].BLK.set(idx, true);
+			if(depth[idx] != d) continue;
+			for(auto e : tnfa.m_edges[idx]) {
+				if(depth[e.dst] < d) { 
+					m_gather[d-1].SRC.set(idx, true);
+					m_gather[d-1].DST.set(e.dst, true);
+					m_scatter[d-1].BLK.set(e.dst, true);
+				}
+				if(depth[e.dst] == d && !e.label && e.src < e.dst){ 
+					m_propagate[d].BLK.set(e.src, true);
+					m_propagate[d].BLK.set(e.dst, true);
+				}
+				if(depth[e.dst] > d) { 
+					m_scatter[d].SRC.set(idx, true);
+					m_scatter[d].DST.set(e.dst, true);
+				}
+			}
+		}
+	}
+
+	std::vector<std::size_t> eps_block(m_state_size);
+	std::size_t id = 1;
+	for(std::size_t idx = 0; idx < m_state_size-1; ++idx) {
+		if(m_propagate[m_depth-1].BLK.get(idx)) {
+			for(; m_propagate[m_depth-1].BLK.get(idx); ++idx) {
+				eps_block[idx] = id;
+			}
+			id += 1;
+		}
+	}
+
+	for(std::size_t d = m_depth-2; d+1 > 0; --d) {
+		for(std::size_t idx = 0; idx < m_state_size; ++idx) {
+			if(depth[idx] != d) continue;
+			for(auto [src, dst, label] : tnfa.m_edges[idx]) {
+				if(!label && d == depth[dst] && src < dst) {
+					if(eps_block[src] != 0) {
+						eps_block[dst] = eps_block[src];
+					} else if(eps_block[dst] != 0) {
+						eps_block[src] = eps_block[dst];
+					} else {
+						eps_block[src] = id;
+						eps_block[dst] = id;
+						id += 1;
+					}
+					m_propagate[d].BLK.set(src, true);
+					m_propagate[d].BLK.set(dst, true);
+				}
+			}
+			/*
+			if(idx != 0 && m_propagate[d].BLK.get(idx-1) && m_propagate[d].BLK.get(idx)){
+				if(eps_block[idx-1] != 0) {
+					eps_block[idx] = eps_block[idx-1];
+				}
+				else {
+					id++;
+					eps_block[idx-1] = id;
+					eps_block[idx] = id;
+					m_propagate[d].BLK.set(idx, true);
+				}
+			}
+			*/
+			if(m_scatter[d].SRC.get(idx)) {
+				std::size_t next_id = eps_block[idx] == 0 ? id+1 : id;
+				for(auto [src, dst, label] : tnfa.m_edges[idx]) {
+					if(!label && src < dst) {
+						for(idx = dst; !m_gather[d].SRC.get(idx); ++idx) {
+							if(eps_block[idx] == 0) break;
+						}
+						if(eps_block[idx] == eps_block[dst] && eps_block[idx] != 0) {
+							while(!m_gather[d].DST.get(idx))++idx;
+							eps_block[idx] = next_id;
+							m_propagate[d].BLK.set(idx, true);
+							m_propagate[d].BLK.set(src, true);
+							eps_block[src] = next_id;
+							id = next_id+1;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+	/*
+	std::cerr << "depth : ";
+	for(auto e : depth) std::cerr << " " << e;
+	std::cerr << std::endl;
+	std::cerr << id << "     : ";
+	for(auto e : eps_block) std::cerr << " " << e;
+	std::cerr << std::endl;
+	*/
+
+	std::vector<std::size_t> eps_src(id+1, m_state_size);
+	std::vector<std::size_t> eps_dst(id+1);
+	for(std::size_t idx = 0; idx < m_state_size; ++idx) {
+		if(eps_block[idx] != 0) {
+			eps_src[eps_block[idx]] = std::min(eps_src[eps_block[idx]], idx);
+			eps_dst[eps_block[idx]] = std::max(eps_dst[eps_block[idx]], idx);
+		}
+	}
+	for(std::size_t i = 1; i < id; ++i) {
+		if(eps_src[i] == eps_dst[i]) m_propagate[depth[eps_src[i]]].BLK.set(eps_src[i], false);
+		else if(eps_src[i] == m_state_size) continue;
+		else {
+			m_propagate[depth[eps_src[i]]].SRC.set(eps_src[i], true);
+			m_propagate[depth[eps_dst[i]]].DST.set(eps_dst[i], true);
+		}
+	}
+
+	/*
+	for(std::size_t i = 0; i < m_depth; ++i){
+		std::cerr << "SCATTER: " << i << std::endl;
+		std::cerr << "BLK ";
+		m_scatter[i].BLK.dump();
+		std::cerr << "SRC ";
+		m_scatter[i].SRC.dump();
+		std::cerr << "DST ";
+		m_scatter[i].DST.dump();
+		std::cerr << "GATHER: " << i << std::endl;
+		std::cerr << "BLK ";
+		m_gather[i].BLK.dump();
+		std::cerr << "SRC ";
+		m_gather[i].SRC.dump();
+		std::cerr << "DST ";
+		m_gather[i].DST.dump();
+		std::cerr << "PROPAGATE: " << i << std::endl;
+		std::cerr << "BLK ";
+		m_propagate[i].BLK.dump();
+		std::cerr << "SRC ";
+		m_propagate[i].SRC.dump();
+		std::cerr << "DST ";
+		m_propagate[i].DST.dump();
+	}
+	*/
+
+	auto find_back_edge = [&](){
+		for(auto a : tnfa.m_edges) for(auto e : a) {
+			if(e.dst < e.src) return true;
+		}
+		return false;
+	};
+	if(find_back_edge()) {
+		m_back_blk = std::vector<std::vector<Bitvector>>(m_depth);
+		m_back_src = std::vector<Bitvector>(m_depth, Bitvector(m_state_size));
+		m_back_dst = std::vector<Bitvector>(m_depth, Bitvector(m_state_size));
+		for(auto a : tnfa.m_edges) for(auto e : a) {
+			if(e.dst < e.src) {
+				assert(!e.label);
+				std::size_t distance = e.src - e.dst;
+				m_back_src[depth[e.src]].set(e.src, true);
+				m_back_dst[depth[e.src]].set(e.dst, true);
+				auto ndigit = [](std::size_t num) -> std::size_t {
+					if(num == 0) return 0;
+					std::size_t ret = 0;
+					while(num >>= 1) { ret++; }
+					return ret;
+				};
+				m_back_blk[depth[e.dst]] = std::vector<Bitvector>(ndigit(distance)+1, Bitvector(m_state_size));
+				for(std::size_t idx = 0; (std::size_t(1) << idx) <= distance; ++idx) {
+					if(distance & (std::size_t(1) << idx)){
+						for(std::size_t j = e.dst; j <= e.src; ++j){
+							m_back_blk[depth[e.dst]][idx].set(j, true);
+						}
+					}
+				}
+			}
+
+			/*
+			for(std::size_t i = 0; i < m_depth; ++i) {
+				std::cerr << "BACK: " << i << std::endl;
+				std::cerr << "SRC ";
+				m_back_src[i].dump();
+				std::cerr << "DST ";
+				m_back_dst[i].dump();
+				std::cerr << "BLK " << std::endl;
+				for(std::size_t j = 0; j < m_back_blk[i].size(); j++) {
+					std::cerr << (1 << j) << ": ";
+					m_back_blk[i][j].dump();
+				}
+			}
+			*/
+		}
+
+	}
+
+}
+
+std::vector<std::size_t> Matcher::match(const std::string &text) {
+	state = Bitvector(m_state_size);
+	state.set(0, true);
+	eps_closure();
+	std::vector<std::size_t> ret;
+	for(std::size_t i = 0; i < text.size(); i++) {
+		if(state.get(m_accept)) ret.push_back(i);
+		move(text[i]);
+		eps_closure();
+	}
+	if(state.get(m_accept)) ret.push_back(text.size());
+	return ret;
+}
+#include "Parser.h"
+
+#include <cstddef>
+#include <cassert>
+#include <iostream>
+#include <vector>
+#include <numeric>
+
+std::size_t Parser::parse_int(std::size_t &idx) {
+	std::size_t ret = pattern[idx] - '0';
+	while(isdigit(pattern[++idx])) {
+		ret = ret*10 + pattern[idx] - '0';
+	}
+	return ret;
+}
+
+
+/* 
+ * BNF 
+ * expr := factor | factor '|' expr
+ * factor := primary | primary factor
+ * primary := atom | '(' expr ')' | '(' expr ')*'
+ * atom :=  alpha | alpha'?' | '.' | alpha'*' | alpha'+' | alpha'{'num','num'}'
+ */
+
+void Parser::expr(std::size_t &idx) {
+	auto check_union = [&](){
+		std::size_t d = 1;
+		for(std::size_t i = idx; d > 0 && i < pattern.size(); ++i) {
+			if(pattern[i] == '(') ++d;
+			if(pattern[i] == ')') --d;
+			if(pattern[i] == '|' && d == 1) return true;
+		}
+		return false;
+	};
+	if(!check_union()){
+		factor(idx);
+		return;
+	}
+	std::size_t src = tnfa.size()-1;
+	std::vector<std::size_t> dst = std::vector<std::size_t>();
+	tnfa.add_state();
+	tnfa.add_edge(src, src+1);
+	factor(idx);
+	dst.push_back(tnfa.size()-1);
+	while(pattern[idx] == '|') {
+		tnfa.add_state();
+		tnfa.add_edge(src, tnfa.size()-1);
+		factor(++idx);
+		dst.push_back(tnfa.size()-1);
+	}
+	tnfa.add_state();
+	std::size_t gather_state = tnfa.size()-1;
+	for(auto e : dst) tnfa.add_edge(e, gather_state);
+}
+
+void Parser::factor(std::size_t &idx) {
+	while(idx < length && pattern[idx] != ')' && pattern[idx] != '|') {
+		primary(idx);
+	}
+}
+
+void Parser::primary(std::size_t &idx) {
+	if(pattern[idx] == '('){
+		++idx;
+		auto is_kleene_star = [&](){
+			auto idx_tmp = idx;
+			for(std::size_t d = 1; d > 0 && idx_tmp < pattern.size(); ++idx_tmp) {
+				if(pattern[idx_tmp] == '(') ++d;
+				if(pattern[idx_tmp] == ')') --d;
+			}
+			if(idx_tmp >= length)return false;
+			return pattern[idx_tmp] == '*';
+		};
+		if(is_kleene_star()) {
+			auto src = tnfa.size()-1;
+			tnfa.add_state();
+			tnfa.add_edge(src, src+1);
+			expr(idx);
+			assert(pattern[idx++] == ')');
+			assert(pattern[idx++] == '*');
+			auto dst = tnfa.size();
+			tnfa.add_edge(dst-1, src+1);
+			tnfa.add_state();
+			tnfa.add_edge(dst-1, dst);
+			tnfa.add_edge(src, dst);
+		} else {
+			expr(idx);
+			assert(pattern[idx] == ')');
+			++idx;
+		}
+	} else {
+		atom(idx);
+	}
+}
+
+void Parser::atom(std::size_t &idx) {
+	std::size_t src = tnfa.size()-1;
+	tnfa.add_state();
+	std::size_t dst = tnfa.size()-1;
+	if(pattern[idx] == '.') {
+		for(std::size_t i = 0; i < SIGMA; ++i) tnfa.add_edge(src, dst, static_cast<char>(i)); 
+		++idx;
+		switch(pattern[idx]) {
+			case '?':
+				tnfa.add_edge(src, dst);
+				break;
+			case '*':
+				tnfa.add_edge(src, dst);
+				for(std::size_t i = 0; i < SIGMA; ++i) tnfa.add_edge(dst, dst, static_cast<char>(i)); 
+				break;
+			case '+': 
+				for(std::size_t i = 0; i < SIGMA; ++i) tnfa.add_edge(dst, dst, static_cast<char>(i)); 
+				break;
+			case '{': {
+				std::size_t x = parse_int(idx);
+				assert(pattern[idx] == ',');
+				std::size_t y = parse_int(idx);
+				assert(pattern[idx] == '}');
+				assert(y > x);
+				tnfa.add_state();
+				for(std::size_t i = 0; i < y-x-1; i++) {
+					for(std::size_t i = 0; i < SIGMA; ++i) tnfa.add_edge(src, dst, static_cast<char>(i)); 
+					tnfa.add_edge(src, dst);
+					tnfa.add_state();
+				}
+				for(std::size_t i = 0; i < x; i++) {
+					for(std::size_t i = 0; i < SIGMA; ++i) tnfa.add_edge(src, dst, static_cast<char>(i)); 
+					tnfa.add_state();
+				}
+			} break;
+			default:
+				--idx;
+		}
+		++idx;
+	} else {
+		if(pattern[idx] == '\\') ++idx;
+		char label = pattern[idx];
+		tnfa.add_edge(src, dst, label);
+		++idx;
+		switch(pattern[idx]) {
+			case '?':
+				tnfa.add_edge(src, dst);
+				break;
+			case '*': 
+				tnfa.add_edge(src, dst);
+				tnfa.add_edge(dst, dst, label);
+				break;
+			case '+': 
+				tnfa.add_edge(dst, dst, label);
+				break;
+			case '{': {
+				std::size_t x = parse_int(idx);
+				assert(pattern[idx] == ',');
+				std::size_t y = parse_int(idx);
+				assert(pattern[idx] == '}');
+				assert(y > x);
+				tnfa.add_state();
+				src++; dst++;
+				for(std::size_t i = 0; i < y-x-1; i++) {
+					tnfa.add_edge(src, dst, label);
+					tnfa.add_edge(src, dst);
+					tnfa.add_state();
+					src++; dst++;
+				}
+				for(std::size_t i = 0; i < x; i++) {
+					tnfa.add_edge(src, dst, label);
+					tnfa.add_state();
+					src++; dst++;
+				}
+			} break;
+			default:
+				--idx;
+		}
+		++idx;
+	}
+}
+
+
+Parser::Parser(const std::string pattern_):
+	pattern(pattern_), length(pattern.size()), tnfa()
+{
+	size_t idx = 0;
+	expr(idx);
+	tnfa.add_rev_edges();
+	/*
+	std::cerr << "----TNFA----" << std::endl;
+	std::cerr << tnfa.m_state_size << " " << std::accumulate(tnfa.m_edges.begin(), tnfa.m_edges.end(), 0, [](std::size_t acc, std::vector<Edge>& a) { return acc+a.size();}) << std::endl;
+	for(std::size_t i = 0; i < tnfa.m_state_size; ++i) {
+		tnfa.dump_edges(i);
+	}
+	std::cerr << "------------" << std::endl;
+	*/
+}
+
+TNFA& Parser::get_tnfa() {
+	return tnfa;
+}
+#include "TNFA.h"
+#include "Parser.h"
+#include "parameter.h"
+
+#include <iostream>
+#include <cassert>
+#include <optional>
+#include <vector>
+#include <string>
+	
+void TNFA::add_state() {
+	m_state_size += 1;
+	m_edges.push_back(std::vector<Edge>());
+}
+
+void TNFA::add_edge(std::size_t src, std::size_t dst) {
+	m_edges[src].emplace_back(src, dst, std::nullopt);
+}
+
+void TNFA::add_edge(std::size_t src, std::size_t dst, char label) {
+	m_edges[src].emplace_back(src, dst, std::optional<char>(label));
+}
+
+void TNFA::add_rev_edges() {
+	m_rev_edges.resize(m_edges.size());
+	for(auto a: m_edges) {
+		for(auto e : a) {
+			m_rev_edges[e.dst].emplace_back(e);
+		}
+	}
+}
+
+void TNFA::dump_edges(std::size_t idx) {
+	for(auto e : m_edges[idx]){
+		std::cerr << e.src << " " << e.dst;
+		if(e.label) std::cerr << " " << e.label.value();
+		std::cerr << std::endl;
+	}
+}
+
+TNFA::TNFA():
+	m_state_size(1), m_edges(std::vector<std::vector<Edge>>(1,std::vector<Edge>())) {}
+
+std::size_t TNFA::size() const {
+	return m_state_size;
+}
+
+std::vector<Edge> TNFA::get_edges(std::size_t src) const {
+	return m_edges[src];
+}
+
+#include "Bitvector.h"
+#include "Parser.h"
+#include "Matcher.h"
+#include <cstddef>
+#include <iostream>
+#include <fstream>
+#include <string>
+
+signed main(int argc, char** argv){
+	std::cin.tie(nullptr);
+	std::ios::sync_with_stdio(false);
+	if(argc != 3){
+		std::cerr << "arg: patternfile textfile" << std::endl;
+		return 1;
+	}
+	std::string pattern;
+	std::ifstream ifs(argv[1]);
+	if(!ifs){
+		std::cerr << "unable to open " << argv[1] << " for pattern" << std::endl;
+		return 1;
+	}
+	std::getline(ifs, pattern);
+	Parser parser(pattern);
+	Matcher matcher(parser.get_tnfa());
+	std::ifstream textfile(argv[2]);
+	if(!textfile){
+		std::string str = argv[2];
+		std::cerr << "unable to open " << std::string(argv[2]) << " for textfile" << std::endl;
+		return 1;
+	}
+	for(std::string text; getline(textfile, text);) {
+		auto midx = matcher.match(text);
+		for(auto e : midx) {
+			std::cout << e << " ";
+		}
+		if(midx.size() == 0) std::cout << "-1";
+		std::cout << std::endl;
+	}
+
+	return 0;
+}
+
+#include <bits/stdc++.h>
+#include <functional>
+#include <optional>
+
+using namespace std;
+
+optional<int> getid(const vector<int> &a, size_t idx) {
+	if( idx < a.size()) return a.at(idx);
+	return std::nullopt;
+}
+
+signed main(){
+	vector<int> arr{0,1,2,3,4};
+	for(size_t i = 0; i < 7; i++){
+		if(auto id = getid(arr, i)){
+			cout << *id << endl;
+		} else{
+			cout << -1 << endl;
+		}
+	}
+
+
+	return 0;
+}
+

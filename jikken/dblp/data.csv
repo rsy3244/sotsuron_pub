@@ -1,0 +1,4 @@
+execute file,pattern file,memory usage,preprocess time,running time
+non-SIMD,long.txt,2088,17.423,1190040
+SIMD,long.txt,2092,7.014,1334260
+python,long.txt,7496,0.936,6654.35
